@@ -1,6 +1,59 @@
 [package]
-name = "Stockimg"
+name = "stockimg"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Web framework (tokio runtime dahil, ayrica tokio/actix-rt eklemeye gerek yok)
+actix-web = "4"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# PostgreSQL (async, migration, datetime)
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "migrate"] }
+
+# Cassandra / ScyllaDB
+scylla = "1.5"
+
+# Redis connection pool (redis crate'i re-export eder, ayrica redis eklemeye gerek yok)
+deadpool-redis = "0.23"
+
+# RabbitMQ AMQP
+lapin = "4"
+
+# Concurrent map (stampede korumasi)
+dashmap = "6"
+
+# Prometheus metrics
+prometheus = "0.14"
+actix-web-prom = "0.10"
+
+# Async trait (dyn dispatch icin gerekli)
+async-trait = "0.1"
+
+# DateTime
+chrono = { version = "0.4", features = ["serde"] }
+
+# Environment config
+dotenvy = "0.15"
+
+# Error handling
+thiserror = "2"
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-actix-web = "0.7"
+
+# URL validation
+url = "2"
+
+# Tokio sync primitives (OnceCell for stampede protection)
+# actix-web tokio runtime'i dahil eder ama sync primitives'i re-export etmez
+tokio = { version = "1", features = ["sync"] }
+
+# Stream utilities (StreamExt for RabbitMQ consumer)
+# lapin futures-core'a bagimli ama StreamExt'i re-export etmez
+futures-util = "0.3"

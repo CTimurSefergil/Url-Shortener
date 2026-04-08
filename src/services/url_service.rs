@@ -1,0 +1,246 @@
+use chrono::{Duration, Utc};
+use dashmap::DashMap;
+use std::sync::Arc;
+
+use crate::config::Config;
+use crate::id_generator::IdGenerator;
+use crate::models::{
+    CachedStats, CachedUrl, CreateUrlRequest, CreateUrlResponse, UrlStats,
+};
+use crate::errors::AppError;
+use crate::infra::cache::UrlCacheOps;
+use crate::infra::db::{CassandraUrl, UrlReadRepository, UrlWriteRepository};
+use crate::infra::queue::producer::{QueueProducer, UrlSyncMessage};
+
+use super::analytics_service::AnalyticsService;
+
+/// Orchestrates URL shortening, redirect, and stats with cache-first logic.
+pub struct UrlService {
+    pg: Arc<dyn UrlWriteRepository>,
+    cassandra: Arc<dyn UrlReadRepository>,
+    cache: Arc<dyn UrlCacheOps>,
+    id_gen: Arc<IdGenerator>,
+    producer: Arc<QueueProducer>,
+    analytics: Arc<AnalyticsService>,
+    config: Config,
+    /// Stampede protection: concurrent requests for the same code
+    /// share a single Cassandra lookup.
+    inflight: DashMap<String, Arc<tokio::sync::OnceCell<Option<CassandraUrl>>>>,
+}
+
+impl UrlService {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        pg: Arc<dyn UrlWriteRepository>,
+        cassandra: Arc<dyn UrlReadRepository>,
+        cache: Arc<dyn UrlCacheOps>,
+        id_gen: Arc<IdGenerator>,
+        producer: Arc<QueueProducer>,
+        analytics: Arc<AnalyticsService>,
+        config: Config,
+    ) -> Self {
+        Self {
+            pg,
+            cassandra,
+            cache,
+            id_gen,
+            producer,
+            analytics,
+            config,
+            inflight: DashMap::new(),
+        }
+    }
+
+    // --- POST /api/shorten ---
+
+    pub async fn shorten(&self, req: CreateUrlRequest) -> Result<CreateUrlResponse, AppError> {
+        // Validate URL
+        url::Url::parse(&req.url)
+            .map_err(|_| AppError::BadRequest("invalid URL".to_string()))?;
+
+        let now = Utc::now();
+        let expires_at = match req.expires_in_secs {
+            Some(secs) => now + Duration::seconds(secs as i64),
+            None => now + Duration::hours(24),
+        };
+
+        // Generate short code
+        let short_code = self.id_gen.next_short_code().await.map_err(|e| {
+            tracing::error!(error = %e, "id generation failed");
+            AppError::Internal("id generation failed".to_string())
+        })?;
+
+        // Write to PostgreSQL (source of truth)
+        let url = crate::models::ShortenedUrl {
+            id: 0, // PG auto-assigns or we use the generated ID
+            short_code: short_code.clone(),
+            original_url: req.url.clone(),
+            created_at: now,
+            expires_at,
+            click_count: 0,
+            last_clicked_at: None,
+        };
+        self.pg.insert(&url).await?;
+
+        // Cache warm (fire-and-forget on failure)
+        let cached = CachedUrl {
+            original_url: req.url.clone(),
+            expires_at: expires_at.timestamp(),
+        };
+        self.cache.set_url(&short_code, &cached).await;
+
+        // Publish to RabbitMQ for Cassandra sync
+        let ttl_secs = req.expires_in_secs.map(|s| s as i32);
+        let msg = UrlSyncMessage {
+            short_code: short_code.clone(),
+            original_url: req.url,
+            created_at_ms: now.timestamp_millis(),
+            expires_at_ms: expires_at.timestamp_millis(),
+            ttl_secs,
+        };
+        if let Err(e) = self.producer.publish(&msg).await {
+            tracing::error!(error = %e, "failed to publish sync message");
+        }
+
+        let short_url = format!("{}/{}", self.config.base_url, short_code);
+
+        Ok(CreateUrlResponse {
+            short_url,
+            short_code,
+            expires_at,
+            created_at: now,
+        })
+    }
+
+    // --- GET /{code} (redirect) ---
+
+    pub async fn redirect(&self, code: &str) -> Result<String, AppError> {
+        let now = Utc::now().timestamp();
+
+        // 1. Check Redis cache
+        if let Some(cached) = self.cache.get_url(code).await {
+            if cached.expires_at > 0 && cached.expires_at < now {
+                self.cache.del_url(code).await;
+                return Err(AppError::Gone);
+            }
+            // Fire-and-forget analytics
+            let code = code.to_string();
+            let analytics = self.analytics.clone();
+            actix_web::rt::spawn(async move {
+                analytics.record_click(&code).await;
+            });
+            return Ok(cached.original_url);
+        }
+
+        // 2. Cache miss — stampede-safe Cassandra lookup
+        let url = self.stampede_safe_lookup(code).await?;
+        let url = url.ok_or(AppError::NotFound)?;
+
+        // Check expiry
+        if url.expires_at.timestamp() < now {
+            return Err(AppError::Gone);
+        }
+
+        // 3. Populate cache
+        let cached = CachedUrl {
+            original_url: url.original_url.clone(),
+            expires_at: url.expires_at.timestamp(),
+        };
+        self.cache.set_url(code, &cached).await;
+
+        // Fire-and-forget analytics
+        let code = code.to_string();
+        let analytics = self.analytics.clone();
+        actix_web::rt::spawn(async move {
+            analytics.record_click(&code).await;
+        });
+
+        Ok(url.original_url)
+    }
+
+    // --- GET /api/stats/{code} ---
+
+    pub async fn stats(&self, code: &str) -> Result<UrlStats, AppError> {
+        // 1. Check stats cache
+        if let Some(cached) = self.cache.get_stats(code).await {
+            return Ok(cached_stats_to_url_stats(cached));
+        }
+
+        // 2. Cache miss — fetch from Cassandra
+        let stats = self
+            .cassandra
+            .get_stats(code)
+            .await?
+            .ok_or(AppError::NotFound)?;
+
+        // 3. Cache the result
+        let cached = CachedStats {
+            short_code: stats.short_code.clone(),
+            original_url: stats.original_url.clone(),
+            created_at: stats.created_at.timestamp(),
+            expires_at: stats.expires_at.timestamp(),
+            click_count: stats.click_count,
+            last_clicked_at: stats.last_clicked_at.map(|t| t.timestamp()),
+        };
+        self.cache
+            .set_stats(code, &cached, self.config.stats_cache_ttl_secs)
+            .await;
+
+        Ok(UrlStats {
+            short_code: stats.short_code,
+            original_url: stats.original_url,
+            created_at: stats.created_at,
+            expires_at: stats.expires_at,
+            click_count: stats.click_count,
+            last_clicked_at: stats.last_clicked_at,
+        })
+    }
+
+    // --- Stampede protection ---
+
+    async fn stampede_safe_lookup(
+        &self,
+        code: &str,
+    ) -> Result<Option<CassandraUrl>, AppError> {
+        // Get or create a OnceCell for this code
+        let cell = self
+            .inflight
+            .entry(code.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone();
+
+        let cassandra = self.cassandra.clone();
+        let code_owned = code.to_string();
+
+        let result = cell
+            .get_or_init(|| async {
+                match cassandra.get_url(&code_owned).await {
+                    Ok(url) => url,
+                    Err(e) => {
+                        tracing::error!(error = %e, code = %code_owned, "cassandra lookup failed");
+                        None
+                    }
+                }
+            })
+            .await;
+
+        // Clean up after all waiters are done
+        self.inflight.remove(code);
+
+        Ok(result.clone())
+    }
+}
+
+fn cached_stats_to_url_stats(c: CachedStats) -> UrlStats {
+    use chrono::TimeZone;
+    UrlStats {
+        short_code: c.short_code,
+        original_url: c.original_url,
+        created_at: Utc.timestamp_opt(c.created_at, 0).single().unwrap_or_default(),
+        expires_at: Utc.timestamp_opt(c.expires_at, 0).single().unwrap_or_default(),
+        click_count: c.click_count,
+        last_clicked_at: c
+            .last_clicked_at
+            .and_then(|t| Utc.timestamp_opt(t, 0).single()),
+    }
+}
