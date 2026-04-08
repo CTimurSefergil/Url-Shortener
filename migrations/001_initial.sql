@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS shortened_urls (
-    id              BIGINT PRIMARY KEY,
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     short_code      VARCHAR(7) NOT NULL UNIQUE,
     original_url    TEXT NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),

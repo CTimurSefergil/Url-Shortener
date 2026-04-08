@@ -20,10 +20,9 @@ impl PgRepository {
 impl UrlWriteRepository for PgRepository {
     async fn insert(&self, url: &ShortenedUrl) -> Result<(), AppError> {
         sqlx::query(
-            "INSERT INTO shortened_urls (id, short_code, original_url, created_at, expires_at)
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO shortened_urls (short_code, original_url, created_at, expires_at)
+             VALUES ($1, $2, $3, $4)",
         )
-        .bind(url.id)
         .bind(&url.short_code)
         .bind(&url.original_url)
         .bind(url.created_at)
